@@ -16,6 +16,7 @@ import psutil
 import time
 import threading
 import gc
+import random
 from enum import Enum
 from multiprocessing import Process, Queue
 
@@ -27,12 +28,47 @@ LOGGER = singer.get_logger()
 LOGGER.setLevel(os.getenv("LOGGER_LEVEL", "INFO"))
 
 
-def create_dataframe(list_dict):
+def extract_field_names(list_dict):
     fields = set()
     for d in list_dict:
         fields = fields.union(d.keys())
-    dataframe = pa.table({f: [row.get(f) for row in list_dict] for f in fields})
+    LOGGER.info(f"final list of fields: {fields}")
+    return fields
+
+
+def create_dataframe(list_dict, fields, dataframe_schema):
+    try:
+        if dataframe_schema is None:
+            dataframe = pa.table(
+                {f: [row.get(f, None) for row in list_dict] for f in fields}
+            )
+            for i in range(len(fields)):
+                new_field_with_nullable = dataframe.schema.field(i).with_nullable(True)
+                dataframe.schema.set(i, new_field_with_nullable)
+            dataframe = pa.table(
+                {f: [row.get(f, None) for row in list_dict] for f in fields},
+                schema=dataframe.schema,
+            )
+        else:
+            dataframe = pa.table(
+                {f: [row.get(f, None) for row in list_dict] for f in fields},
+                schema=dataframe_schema,
+            )
+    except Exception as e:
+        LOGGER.info(f"exception for data frame: {e}")
+        raise
     return dataframe
+
+
+def get_schema(list_dict, fields):
+    try:
+        dataframe = pa.table(
+            {f: [row.get(f, None) for row in list_dict] for f in fields}
+        )
+    except Exception as e:
+        LOGGER.info(f"exception for schema: {e}")
+        raise
+    return dataframe.schema
 
 
 class MessageType(Enum):
@@ -45,7 +81,7 @@ class MessageType(Enum):
 def emit_state(state):
     if state is not None:
         line = json.dumps(state)
-        LOGGER.debug("Emitting state {}".format(line))
+        LOGGER.info("Emitting state {}".format(line))
         sys.stdout.write("{}\n".format(line))
         sys.stdout.flush()
 
@@ -59,7 +95,7 @@ class MemoryReporter(threading.Thread):
 
     def run(self):
         while True:
-            LOGGER.debug(
+            LOGGER.info(
                 "Virtual memory usage: %.2f%% of total: %s",
                 self.process.memory_percent(),
                 self.process.memory_info(),
@@ -91,7 +127,7 @@ def persist_messages(
         }
         compression_extension = extension_mapping.get(compression_method.upper())
         if compression_extension is None:
-            LOGGER.warning("unsuported compression method.")
+            LOGGER.info("unsuported compression method.")
             compression_extension = ""
             compression_method = None
     filename_separator = "-"
@@ -130,17 +166,17 @@ def persist_messages(
                     w_queue.put((MessageType.RECORD, stream_name, flattened_record))
                     state = None
                 elif message_type == "STATE":
-                    LOGGER.debug("Setting state to {}".format(message["value"]))
+                    LOGGER.info("Setting state to {}".format(message["value"]))
                     state = message["value"]
                 elif message_type == "SCHEMA":
                     stream = message["stream"]
                     validators[stream] = Draft4Validator(message["schema"])
                     schemas[stream] = flatten_schema(message["schema"]["properties"])
-                    LOGGER.debug(f"Schema: {schemas[stream]}")
+                    LOGGER.info(f"Schema: {schemas[stream]}")
                     key_properties[stream] = message["key_properties"]
                     w_queue.put((MessageType.SCHEMA, stream, schemas[stream]))
                 else:
-                    LOGGER.warning(
+                    LOGGER.info(
                         "Unknown message type {} in message {}".format(
                             message["type"], message
                         )
@@ -149,30 +185,55 @@ def persist_messages(
             return state
         except Exception as Err:
             w_queue.put((MessageType.EOF, _break_object, None))
+            LOGGER.info(f"exception in processing {Err}")
             raise Err
 
     def write_file(current_stream_name, record):
+        batch_size = 9704
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S-%f")
-        LOGGER.debug(f"Writing files from {current_stream_name} stream")
-        dataframe = create_dataframe(record)
+        LOGGER.info(f"Writing files from {current_stream_name} stream")
+        fields = extract_field_names(record)
+        LOGGER.info(f"data frame created")
+
         if streams_in_separate_folder and not os.path.exists(
             os.path.join(destination_path, current_stream_name)
         ):
             os.makedirs(os.path.join(destination_path, current_stream_name))
-        filename = (
-            current_stream_name
-            + filename_separator
-            + timestamp
-            + compression_extension
-            + ".parquet"
-        )
+        filename = current_stream_name + filename_separator + timestamp
+
         filepath = os.path.expanduser(os.path.join(destination_path, filename))
-        with open(filepath, "wb") as f:
-            ParquetWriter(
-                f, dataframe.schema, compression=compression_method
-            ).write_table(dataframe)
-        ## explicit memory management. This can be usefull when working on very large data groups
-        del dataframe
+        dataframe_schema = None
+
+        batches_schema = []
+        for row_number in range(0, len(record), batch_size):
+            schema = get_schema(record[row_number : row_number + batch_size], fields)
+            batches_schema.append(schema)
+            # LOGGER.info(f"get_schema: {schema}")
+        schema = pa.unify_schemas(batches_schema)
+
+        LOGGER.info(f"filepath will be {filepath}")
+        for row_number in range(0, len(record), batch_size):
+            file_part = (
+                filepath + "." + str(row_number) + ".parquet" + compression_extension
+            )
+            with open(file_part, "wb") as f:
+                LOGGER.info(f"starting to write parquet file {filepath}")
+                try:
+                    dataframe = create_dataframe(
+                        record[row_number : row_number + batch_size], fields, schema
+                    )
+                    # using the same schema for all of the files
+                    ParquetWriter(
+                        f, schema, compression=compression_method
+                    ).write_table(dataframe)
+                    LOGGER.info(f"wrote parquet for {file_part}")
+                    ## explicit memory management. This can be usefull when working on very large data groups
+                    del dataframe
+                except Exception as e:
+                    LOGGER.info(f"exception: {e}")
+                    raise
+
+        LOGGER.info(f"returning the filepath {filepath}")
         return filepath
 
     def consumer(receiver):
@@ -210,41 +271,50 @@ def persist_messages(
             elif message_type == MessageType.SCHEMA:
                 schemas[stream_name] = record
             elif message_type == MessageType.EOF:
-                files_created.append(
-                    write_file(current_stream_name, records.pop(current_stream_name))
-                )
-                LOGGER.info(f"Wrote {len(files_created)} files")
-                LOGGER.debug(f"Wrote {files_created} files")
-                break
+                try:
+                    LOGGER.info(f"Writing {current_stream_name} files")
+                    files_created.append(
+                        write_file(
+                            current_stream_name, records.pop(current_stream_name)
+                        )
+                    )
+                    LOGGER.info(f"Wrote {len(files_created)} files")
+                    LOGGER.info(f"Wrote {files_created} files")
+                    break
+                except Exception as Err:
+                    LOGGER.error(Err)
+                    raise Err
 
     q = Queue()
-    t2 = Process(
-        target=consumer,
-        args=(q,),
-    )
-    t2.start()
+    # t2 = Process(
+    #    target=consumer,
+    #    args=(q,),
+    # )
+    # t2.start()
     state = producer(messages, q)
-    t2.join()
+    consumer(q)
+    # t2.join()
     return state
 
 
 def send_usage_stats():
     try:
-        version = pkg_resources.get_distribution("target-parquet").version
-        conn = http.client.HTTPConnection("collector.singer.io", timeout=10)
-        conn.connect()
-        params = {
-            "e": "se",
-            "aid": "singer",
-            "se_ca": "target-parquet",
-            "se_ac": "open",
-            "se_la": version,
-        }
-        conn.request("GET", "/i?" + urllib.parse.urlencode(params))
-        conn.getresponse()
-        conn.close()
+        pass
+        # version = pkg_resources.get_distribution("target-parquet").version
+        # conn = http.client.HTTPConnection("collector.singer.io", timeout=10)
+        # conn.connect()
+        # params = {
+        #    "e": "se",
+        #    "aid": "singer",
+        #    "se_ca": "target-parquet",
+        #    "se_ac": "open",
+        #    "se_la": version,
+        # }
+        # conn.request("GET", "/i?" + urllib.parse.urlencode(params))
+        # conn.getresponse()
+        # conn.close()
     except:
-        LOGGER.debug("Collection request failed")
+        LOGGER.info("Collection request failed")
 
 
 def main():
@@ -269,7 +339,7 @@ def main():
         threading.Thread(target=send_usage_stats).start()
     # The target expects that the tap generates UTF-8 encoded text.
     input_messages = TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
-    if LOGGER.level == 0:
+    if True or LOGGER.level == 0:
         MemoryReporter().start()
     state = persist_messages(
         input_messages,
@@ -280,7 +350,7 @@ def main():
     )
 
     emit_state(state)
-    LOGGER.debug("Exiting normally")
+    LOGGER.info("Exiting normally")
 
 
 if __name__ == "__main__":
