@@ -189,7 +189,7 @@ def persist_messages(
             raise Err
 
     def write_file(current_stream_name, record):
-        batch_size = 10004
+        batch_size = 16004
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S-%f")
         LOGGER.info(f"Writing files from {current_stream_name} stream")
         fields = extract_field_names(record)
