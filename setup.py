@@ -2,6 +2,9 @@
 
 from setuptools import setup
 
+setup_requirements = [
+  "setuptools>=64", "setuptools-scm>=8"
+]
 setup(
     name="target-parquet",
     version="0.2.5",
